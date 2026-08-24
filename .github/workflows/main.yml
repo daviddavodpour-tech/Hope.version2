@@ -1,0 +1,284 @@
+name: Hope22 Self Repair APK Builder
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+
+permissions:
+  contents: write
+
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "17"
+
+
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+
+
+    - name: Find Flutter project
+      id: project
+      shell: bash
+      run: |
+
+        PUBSPEC=$(find . \
+        -name pubspec.yaml \
+        -not -path "./.git/*" \
+        | head -1)
+
+
+        if [ -z "$PUBSPEC" ]; then
+          echo "Flutter project not found"
+          exit 1
+        fi
+
+
+        DIR=$(dirname "$PUBSPEC")
+
+
+        echo "path=$DIR" >> $GITHUB_OUTPUT
+
+        echo "Flutter project:"
+        echo "$DIR"
+
+
+
+    - name: Flutter doctor
+      run: flutter doctor -v
+
+
+
+    - name: Install packages
+      working-directory: ${{ steps.project.outputs.path }}
+      run: |
+
+        flutter clean
+        flutter pub get
+
+
+
+    # ---------------------------------------------
+    # Android Repair
+    # ---------------------------------------------
+
+    - name: Repair Android NDK
+      working-directory: ${{ steps.project.outputs.path }}
+      shell: bash
+      run: |
+
+        TARGET="28.2.13676358"
+
+
+        if [ -f android/app/build.gradle.kts ]; then
+
+          if grep -q ndkVersion android/app/build.gradle.kts
+          then
+            sed -i \
+            "s/ndkVersion.*/ndkVersion = \"$TARGET\"/" \
+            android/app/build.gradle.kts
+
+          else
+            sed -i \
+            "/android {/a\\
+            ndkVersion = \"$TARGET\"" \
+            android/app/build.gradle.kts
+          fi
+
+        fi
+
+
+
+        if [ -f android/app/build.gradle ]; then
+
+          if grep -q ndkVersion android/app/build.gradle
+          then
+            sed -i \
+            "s/ndkVersion.*/ndkVersion \"$TARGET\"/" \
+            android/app/build.gradle
+
+          else
+            sed -i \
+            "/android {/a\\
+            ndkVersion \"$TARGET\"" \
+            android/app/build.gradle
+          fi
+
+        fi
+
+
+
+    # ---------------------------------------------
+    # Repair Loop
+    # ---------------------------------------------
+
+    - name: Auto Repair Loop
+      working-directory: ${{ steps.project.outputs.path }}
+      shell: bash
+      run: |
+
+        MAX=3
+        TRY=1
+
+
+        while [ $TRY -le $MAX ]
+
+        do
+
+          echo "=========================="
+          echo "Repair cycle $TRY/$MAX"
+          echo "=========================="
+
+
+          dart fix --apply || true
+
+          dart format . || true
+
+
+          flutter pub get
+
+
+
+          if flutter analyze
+          then
+            echo "Analyze OK"
+          else
+            echo "Analyze still has issues"
+          fi
+
+
+
+          if flutter test
+          then
+            echo "Tests OK"
+            break
+          fi
+
+
+
+          echo "Tests failed - collecting diagnostics"
+
+
+          flutter pub outdated || true
+
+
+          TRY=$((TRY+1))
+
+
+        done
+
+
+
+    # ---------------------------------------------
+    # Build
+    # ---------------------------------------------
+
+    - name: Build Release APK
+      working-directory: ${{ steps.project.outputs.path }}
+      shell: bash
+      run: |
+
+
+        flutter clean
+
+        flutter pub get
+
+
+        flutter build apk \
+        --release \
+        --no-tree-shake-icons
+
+
+
+    - name: Find APK
+      id: apk
+      shell: bash
+      run: |
+
+        APK=$(find "${{ steps.project.outputs.path }}" \
+        -name "*.apk" \
+        | head -1)
+
+
+        if [ -z "$APK" ]; then
+          echo "APK missing"
+          exit 1
+        fi
+
+
+        echo "file=$APK" >> $GITHUB_OUTPUT
+
+
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+
+        name: Hope22-release-apk
+
+        path: ${{ steps.apk.outputs.file }}
+
+        retention-days: 30
+
+
+
+    - name: Build Report
+      run: |
+
+        echo "# ✅ Hope22 APK Built" >> $GITHUB_STEP_SUMMARY
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "Download:" >> $GITHUB_STEP_SUMMARY
+
+        echo "https://github.com/${{github.repository}}/actions/runs/${{github.run_id}}" >> $GITHUB_STEP_SUMMARY
+
+
+
+    - name: Commit Repairs
+      if: always()
+      shell: bash
+      run: |
+
+        git config user.name "github-actions"
+
+        git config user.email "actions@github.com"
+
+
+        git add .
+
+
+        git commit \
+        -m "Auto repair Flutter build issues" \
+        || true
+
+
+        git push \
+        || true
