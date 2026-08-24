@@ -1,0 +1,462 @@
+name: HOPE - Claude Auto Repair and APK Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: write
+  issues: write
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+  API_BASE_URL: "http://10.0.2.2:3000/api/v1"
+  MAX_REPAIR_CYCLES: "3"
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ----------------------------------------------------------
+      # CHECKOUT
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+
+      # ----------------------------------------------------------
+      # JAVA
+      # ----------------------------------------------------------
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+
+      # ----------------------------------------------------------
+      # FLUTTER
+      # ----------------------------------------------------------
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+
+      # ----------------------------------------------------------
+      # DETECT PROJECT
+      # ----------------------------------------------------------
+
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT=""
+
+          while IFS= read -r FILE; do
+            DIR="$(dirname "$FILE")"
+
+            if [ -d "$DIR/lib" ] &&
+               [ -d "$DIR/android" ]; then
+              PROJECT="$DIR"
+              break
+            fi
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name "pubspec.yaml" \
+              -not -path "*/.git/*" \
+              -not -path "*/build/*" \
+              -not -path "*/.dart_tool/*" \
+              | sort
+          )
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Flutter project was not found."
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 6 \
+              -type f \
+              | sort \
+              | head -1000
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+
+          echo "Flutter project detected:"
+          echo "$PROJECT"
+
+
+      # ----------------------------------------------------------
+      # CLAUDE - PROACTIVE FULL AUDIT
+      # ----------------------------------------------------------
+
+      - name: Claude proactive code audit and repair
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          prompt: |
+            You are the senior repair engineer for this Flutter repository.
+
+            Your job is to inspect the entire repository and proactively repair
+            real bugs, test failures, build failures, Android/Gradle/NDK issues,
+            dependency issues, Provider wiring issues, and incorrect tests.
+
+            IMPORTANT RULES:
+
+            1. Do not make cosmetic changes unless necessary.
+            2. Do not rewrite working architecture unnecessarily.
+            3. Inspect the actual code before changing anything.
+            4. Read main.dart, app root widgets, controllers, providers,
+               networking, Android Gradle configuration, pubspec.yaml,
+               tests and integration tests.
+            5. Pay special attention to:
+               - ProviderNotFoundException
+               - ThemeController
+               - AuthController
+               - WorkMarketplaceApp
+               - smoke tests
+               - API configuration
+               - Android NDK compatibility
+               - Gradle compatibility
+               - Flutter/Dart analyzer errors
+               - broken or stale tests
+            6. Run:
+               flutter pub get
+               flutter analyze
+               flutter test
+            7. If something fails, diagnose the actual root cause and fix it.
+            8. Do NOT silence failures with `|| true`.
+            9. Do NOT delete tests just to make CI green.
+            10. Keep tests meaningful.
+            11. After changes, rerun relevant tests.
+            12. Prepare the repository so a release APK can be built.
+            13. Commit legitimate repairs directly to the current branch.
+            14. At the end, summarize:
+                - files changed
+                - root causes found
+                - tests run
+                - remaining issues
+
+          claude_args: |
+            --max-turns 15
+            --allowedTools Edit,Read,Write,Bash
+            --disallowedTools WebSearch
+            --append-system-prompt "Act as a conservative senior Flutter/Android engineer. Never hide a failure merely to make CI green. Fix root causes and preserve application behavior."
+
+
+      # ----------------------------------------------------------
+      # DEPENDENCIES
+      # ----------------------------------------------------------
+
+      - name: Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+
+
+      # ----------------------------------------------------------
+      # ANDROID NDK
+      # ----------------------------------------------------------
+
+      - name: Normalize Android NDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f android/app/build.gradle.kts ]; then
+
+            FILE="android/app/build.gradle.kts"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          elif [ -f android/app/build.gradle ]; then
+
+            FILE="android/app/build.gradle"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          else
+            echo "::error::Android Gradle file not found."
+            exit 1
+          fi
+
+
+      # ----------------------------------------------------------
+      # QUALITY CHECK
+      # ----------------------------------------------------------
+
+      - name: Analyze
+        id: analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          flutter analyze 2>&1 | tee analyze.log
+
+
+      - name: Tests
+        id: tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          flutter test --coverage 2>&1 | tee test.log
+
+
+      # ----------------------------------------------------------
+      # CLAUDE - REPAIR AFTER TEST/ANALYZE FAILURE
+      # ----------------------------------------------------------
+
+      - name: Claude repair after quality failure
+        if: steps.analyze.outcome == 'failure' || steps.tests.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          prompt: |
+            The Flutter quality gate failed.
+
+            Inspect:
+              analyze.log
+              test.log
+              the complete repository
+
+            Diagnose the actual root causes.
+
+            You MUST:
+            - read the failing source files
+            - read the relevant tests
+            - inspect the app/provider architecture
+            - inspect main.dart and WorkMarketplaceApp
+            - repair the real cause
+            - repair tests when tests are stale or incorrectly wired
+            - never delete tests just to get green
+            - never replace meaningful tests with empty tests
+            - run the relevant Flutter tests after repairing
+            - run flutter analyze after repairing
+
+            Known historical failures in this project include:
+            - ProviderNotFoundException for ThemeController
+            - smoke_app_test expecting MaterialApp without the correct app/provider tree
+            - Android NDK 27 versus plugins requiring NDK 28.2
+            - stale analyzer/lint fixes
+
+            Continue until the project is in a materially healthier state.
+
+            Commit the legitimate fixes.
+
+          claude_args: |
+            --max-turns 15
+            --allowedTools Edit,Read,Write,Bash
+            --disallowedTools WebSearch
+            --append-system-prompt "Fix root causes. Never silence tests or convert real failures into warnings. Preserve production behavior."
+
+
+      # ----------------------------------------------------------
+      # RETEST AFTER CLAUDE
+      # ----------------------------------------------------------
+
+      - name: Re-run Flutter analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter analyze
+
+
+      - name: Re-run Flutter tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter test --coverage
+
+
+      # ----------------------------------------------------------
+      # BUILD WITH RETRY
+      # ----------------------------------------------------------
+
+      - name: Build debug APK
+        id: debug_build
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          flutter clean
+          flutter pub get
+
+          flutter build apk \
+            --debug \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+
+      # ----------------------------------------------------------
+      # CLAUDE - REPAIR BUILD FAILURE
+      # ----------------------------------------------------------
+
+      - name: Claude repair Android build failure
+        if: steps.debug_build.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+          prompt: |
+            The Android APK build failed.
+
+            Act as a senior Flutter + Android build engineer.
+
+            Inspect the complete build logs and repository.
+
+            Diagnose and fix:
+            - Gradle errors
+            - Android plugin compatibility
+            - Kotlin/Java compatibility
+            - Android SDK configuration
+            - NDK configuration
+            - manifest errors
+            - resource errors
+            - dependency conflicts
+            - Flutter plugin incompatibilities
+            - generated configuration problems
+
+            Do not blindly change versions.
+
+            Determine the root cause from the actual failure.
+
+            Then:
+            1. repair the source/configuration
+            2. run flutter pub get
+            3. run flutter analyze
+            4. run relevant tests
+            5. run flutter build apk --debug
+            6. commit legitimate fixes
+
+          claude_args: |
+            --max-turns 15
+            --allowedTools Edit,Read,Write,Bash
+            --disallowedTools WebSearch
+
+
+      # ----------------------------------------------------------
+      # FINAL DEBUG BUILD
+      # ----------------------------------------------------------
+
+      - name: Final debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+
+          flutter build apk \
+            --debug \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+
+      # ----------------------------------------------------------
+      # RELEASE BUILD
+      # ----------------------------------------------------------
+
+      - name: Release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+
+      # ----------------------------------------------------------
+      # LOCATE APK
+      # ----------------------------------------------------------
+
+      - name: Locate APKs
+        id: apk
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG="$(find . -type f -name 'app-debug.apk' | head -1)"
+          RELEASE="$(find . -type f -name 'app-release.apk' | head -1)"
+
+          test -n "$DEBUG"
+          test -n "$RELEASE"
+
+          echo "debug=$PROJECT_DIR/${DEBUG#./}" >> "$GITHUB_OUTPUT"
+          echo "release=$PROJECT_DIR/${RELEASE#./}" >> "$GITHUB_OUTPUT"
+
+
+      # ----------------------------------------------------------
+      # UPLOAD ARTIFACTS
+      # ----------------------------------------------------------
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-debug-apk
+          path: ${{ steps.apk.outputs.debug }}
+          retention-days: 30
+
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: ${{ steps.apk.outputs.release }}
+          retention-days: 30
+
+
+      # ----------------------------------------------------------
+      # FINAL SUMMARY
+      # ----------------------------------------------------------
+
+      - name: Final build summary
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          {
+            echo "# ✅ HOPE APK BUILD COMPLETE"
+            echo
+            echo "Project: \`$PROJECT_DIR\`"
+            echo
+            echo "## Download"
+            echo
+            echo "[📥 Download APK artifacts](${RUN_URL}#artifacts)"
+            echo
+            echo "- HOPE-debug-apk"
+            echo "- HOPE-release-apk"
+            echo
+            echo "Claude Code was used for proactive audit and failure repair."
+          } >> "$GITHUB_STEP_SUMMARY"
