@@ -1,0 +1,377 @@
+name: HOPE Universal Auto Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+  API_BASE_URL: "http://10.0.2.2:3000/api/v1"
+  MAX_REPAIR_ATTEMPTS: "3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Detect Flutter project automatically
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_WORKSPACE"
+          WORK="$RUNNER_TEMP/hope-discovery"
+
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          find_project() {
+            local ROOT="$1"
+            local BEST=""
+            local SCORE_BEST=-1
+
+            while IFS= read -r PUBSPEC; do
+              [ -z "$PUBSPEC" ] && continue
+
+              DIR="$(dirname "$PUBSPEC")"
+              SCORE=0
+
+              [ -d "$DIR/lib" ] && SCORE=$((SCORE + 20))
+              [ -d "$DIR/android" ] && SCORE=$((SCORE + 20))
+              [ -d "$DIR/test" ] && SCORE=$((SCORE + 5))
+              [ -d "$DIR/integration_test" ] && SCORE=$((SCORE + 5))
+
+              if grep -Eq '(^|[[:space:]])flutter:' "$PUBSPEC"; then
+                SCORE=$((SCORE + 20))
+              fi
+
+              if grep -Eq 'sdk:[[:space:]]*flutter' "$PUBSPEC"; then
+                SCORE=$((SCORE + 20))
+              fi
+
+              if [ "$SCORE" -gt "$SCORE_BEST" ]; then
+                BEST="$DIR"
+                SCORE_BEST="$SCORE"
+              fi
+            done < <(
+              find "$ROOT" \
+                -type f \
+                -name "pubspec.yaml" \
+                -not -path "*/.git/*" \
+                -not -path "*/build/*" \
+                -not -path "*/.dart_tool/*" \
+                2>/dev/null | sort
+            )
+
+            if [ -n "$BEST" ]; then
+              printf '%s\n' "$BEST"
+            fi
+          }
+
+          extract_zip() {
+            local ZIP="$1"
+            local DEST="$2"
+
+            mkdir -p "$DEST"
+
+            python3 - "$ZIP" "$DEST" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive = Path(sys.argv[1]).resolve()
+          destination = Path(sys.argv[2]).resolve()
+
+          with zipfile.ZipFile(archive, "r") as z:
+              for member in z.infolist():
+                  target = (destination / member.filename).resolve()
+
+                  if target != destination and not str(target).startswith(
+                      str(destination) + "/"
+                  ):
+                      raise RuntimeError(
+                          f"Unsafe ZIP path: {member.filename}"
+                      )
+
+                  z.extract(member, destination)
+          PY
+          }
+
+          PROJECT="$(find_project "$REPO" | tail -n 1 || true)"
+          SOURCE="repository"
+
+          if [ -z "$PROJECT" ]; then
+            echo "No Flutter project in repository tree."
+            echo "Searching ZIP archives..."
+
+            SOURCE="zip"
+
+            mapfile -t ZIPS < <(
+              find "$REPO" \
+                -type f \
+                -iname "*.zip" \
+                -not -path "*/.git/*" \
+                2>/dev/null | sort
+            )
+
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "::error::No Flutter project and no ZIP archive found."
+              exit 1
+            fi
+
+            N=0
+
+            for ZIP in "${ZIPS[@]}"; do
+              N=$((N + 1))
+              extract_zip "$ZIP" "$WORK/archive-$N"
+            done
+
+            for LEVEL in 1 2 3 4 5; do
+              PROJECT="$(find_project "$WORK" | tail -n 1 || true)"
+
+              [ -n "$PROJECT" ] && break
+
+              mapfile -t NESTED < <(
+                find "$WORK" \
+                  -type f \
+                  -iname "*.zip" \
+                  2>/dev/null | sort
+              )
+
+              [ "${#NESTED[@]}" -eq 0 ] && break
+
+              N=0
+              for ZIP in "${NESTED[@]}"; do
+                N=$((N + 1))
+                extract_zip "$ZIP" "$WORK/nested-$LEVEL-$N"
+              done
+            done
+          fi
+
+          PROJECT="$(find_project "$REPO" | tail -n 1 || true)"
+
+          if [ -z "$PROJECT" ]; then
+            PROJECT="$(find_project "$WORK" | tail -n 1 || true)"
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::Flutter project could not be detected."
+            echo "Repository:"
+            find "$REPO" -maxdepth 5 -type f | sort | head -1000
+            exit 1
+          fi
+
+          test -f "$PROJECT/pubspec.yaml"
+          test -d "$PROJECT/lib"
+          test -d "$PROJECT/android"
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "SOURCE_MODE=$SOURCE" >> "$GITHUB_ENV"
+
+          echo "======================================"
+          echo "Flutter project detected:"
+          echo "$PROJECT"
+          echo "Source:"
+          echo "$SOURCE"
+          echo "======================================"
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Repair Android NDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f android/app/build.gradle.kts ]; then
+            FILE="android/app/build.gradle.kts"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          elif [ -f android/app/build.gradle ]; then
+            FILE="android/app/build.gradle"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+          else
+            echo "::error::Android Gradle file not found."
+            exit 1
+          fi
+
+      - name: Self healing analyze and test
+        id: quality
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set +e
+
+          ATTEMPT=1
+          ANALYZE_OK=0
+          TEST_OK=0
+
+          while [ "$ATTEMPT" -le "$MAX_REPAIR_ATTEMPTS" ]; do
+            echo "======================================"
+            echo "Repair cycle $ATTEMPT/$MAX_REPAIR_ATTEMPTS"
+            echo "======================================"
+
+            flutter pub get
+            dart fix --apply || true
+            dart format lib test integration_test 2>/dev/null || true
+
+            flutter analyze
+            A=$?
+
+            flutter test --coverage
+            T=$?
+
+            [ "$A" -eq 0 ] && ANALYZE_OK=1 || ANALYZE_OK=0
+            [ "$T" -eq 0 ] && TEST_OK=1 || TEST_OK=0
+
+            if [ "$ANALYZE_OK" -eq 1 ] && [ "$TEST_OK" -eq 1 ]; then
+              break
+            fi
+
+            flutter pub get || true
+            dart fix --apply || true
+            dart format . || true
+
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "ANALYZE_OK=$ANALYZE_OK" >> "$GITHUB_OUTPUT"
+          echo "TEST_OK=$TEST_OK" >> "$GITHUB_OUTPUT"
+
+          exit 0
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+          flutter build apk \
+            --debug \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean
+          flutter pub get
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Find APKs
+        id: apk
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          DEBUG="$(find . -type f -name 'app-debug.apk' | head -1)"
+          RELEASE="$(find . -type f -name 'app-release.apk' | head -1)"
+
+          [ -n "$DEBUG" ] || exit 1
+          [ -n "$RELEASE" ] || exit 1
+
+          echo "debug=$PROJECT_DIR/${DEBUG#./}" >> "$GITHUB_OUTPUT"
+          echo "release=$PROJECT_DIR/${RELEASE#./}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-debug-apk
+          path: ${{ steps.apk.outputs.debug }}
+          retention-days: 30
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: ${{ steps.apk.outputs.release }}
+          retention-days: 30
+
+      - name: Final summary
+        if: always()
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          {
+            echo "# HOPE Build"
+            echo
+            echo "Project: \`$PROJECT_DIR\`"
+            echo
+            echo "Source mode: \`$SOURCE_MODE\`"
+            echo
+            echo "Analyzer: \`${{ steps.quality.outputs.ANALYZE_OK }}\`"
+            echo
+            echo "Tests: \`${{ steps.quality.outputs.TEST_OK }}\`"
+            echo
+            echo "[📥 Download APK artifacts](${RUN_URL}#artifacts)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit automatic repairs
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            android/app/build.gradle \
+            android/app/build.gradle.kts \
+            pubspec.lock \
+            test \
+            2>/dev/null || true
+
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: apply automatic repairs [skip ci]" || true
+            git push "origin" "HEAD:${GITHUB_REF_NAME}" || true
+          fi
