@@ -1,0 +1,262 @@
+name: HOPE - Build APK and Publish Download
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "28.2.13676358"
+  API_BASE_URL: "http://10.0.2.2:3000/api/v1"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_project() {
+            local root="$1"
+            local best=""
+            local best_score=-1
+
+            while IFS= read -r pubspec; do
+              [ -z "$pubspec" ] && continue
+
+              dir="$(dirname "$pubspec")"
+              score=0
+
+              [ -d "$dir/lib" ] && score=$((score + 20))
+              [ -d "$dir/android" ] && score=$((score + 20))
+              [ -d "$dir/test" ] && score=$((score + 5))
+              [ -d "$dir/integration_test" ] && score=$((score + 5))
+
+              if grep -Eq '(^|[[:space:]])flutter:' "$pubspec"; then
+                score=$((score + 20))
+              fi
+
+              if grep -Eq 'sdk:[[:space:]]*flutter' "$pubspec"; then
+                score=$((score + 20))
+              fi
+
+              if [ "$score" -gt "$best_score" ]; then
+                best="$dir"
+                best_score="$score"
+              fi
+            done < <(
+              find "$root" \
+                -type f \
+                -name "pubspec.yaml" \
+                -not -path "*/.git/*" \
+                -not -path "*/build/*" \
+                -not -path "*/.dart_tool/*" \
+                2>/dev/null | sort
+            )
+
+            [ -n "$best" ] && printf '%s\n' "$best"
+          }
+
+          PROJECT_DIR="$(find_project "$GITHUB_WORKSPACE" | tail -n 1 || true)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Flutter project not found."
+            exit 1
+          fi
+
+          test -f "$PROJECT_DIR/pubspec.yaml"
+          test -d "$PROJECT_DIR/lib"
+          test -d "$PROJECT_DIR/android"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Detected project:"
+          echo "$PROJECT_DIR"
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Repair Android NDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f android/app/build.gradle.kts ]; then
+            FILE="android/app/build.gradle.kts"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          elif [ -f android/app/build.gradle ]; then
+            FILE="android/app/build.gradle"
+
+            if grep -q "ndkVersion" "$FILE"; then
+              sed -i \
+                "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                "$FILE"
+            else
+              sed -i \
+                "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                "$FILE"
+            fi
+
+          else
+            echo "::error::Android Gradle file not found."
+            exit 1
+          fi
+
+      - name: Auto repair Dart
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dart fix --apply || true
+          dart format lib test integration_test 2>/dev/null || true
+          flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter analyze
+
+      - name: Test
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter test --coverage
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          flutter clean
+          flutter pub get
+
+          flutter build apk \
+            --release \
+            --dart-define=API_BASE_URL="${API_BASE_URL}"
+
+      - name: Locate APK
+        id: apk
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find . \
+            -type f \
+            -name "app-release.apk" \
+            | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            APK="$(find . \
+              -type f \
+              -name "*.apk" \
+              | head -n 1)"
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "::error::No APK generated."
+            exit 1
+          fi
+
+          cp "$APK" "$GITHUB_WORKSPACE/Hope22.apk"
+
+          echo "APK_PATH=$GITHUB_WORKSPACE/Hope22.apk" >> "$GITHUB_ENV"
+
+          ls -lh "$GITHUB_WORKSPACE/Hope22.apk"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hope22-apk
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Create GitHub Release
+        id: release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ github.token }}
+          tag: "build-${{ github.run_number }}"
+          name: "Hope22 Build ${{ github.run_number }}"
+          allowUpdates: false
+          replacesArtifacts: true
+          artifacts: "${{ env.APK_PATH }}"
+          artifactContentType: "application/vnd.android.package-archive"
+          body: |
+            # Hope22 APK
+
+            Automatically built by GitHub Actions.
+
+            Flutter: ${{ env.FLUTTER_VERSION }}
+            Build: ${{ github.run_number }}
+            Commit: ${{ github.sha }}
+
+      - name: Create download link
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_URL="${{ steps.release.outputs.html_url }}"
+
+          echo "=================================================="
+          echo "HOPE22 APK READY"
+          echo "=================================================="
+          echo
+          echo "Release:"
+          echo "$RELEASE_URL"
+          echo
+
+          {
+            echo "# ✅ Hope22 APK Ready"
+            echo
+            echo "## Download"
+            echo
+            echo "[📥 Download / Save Hope22.apk]($RELEASE_URL)"
+            echo
+            echo "Release page:"
+            echo "$RELEASE_URL"
+            echo
+            echo "Artifact:"
+            echo "\`Hope22.apk\`"
+          } >> "$GITHUB_STEP_SUMMARY"
