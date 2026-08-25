@@ -1,0 +1,260 @@
+      - name: Persistent repair-test-build loop
+        id: persistent_loop
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          MAX_CYCLES: "15"
+        run: |
+          set -u
+
+          CYCLE=1
+          SUCCESS=0
+
+          mkdir -p "$GITHUB_WORKSPACE/.repair-state"
+
+          echo "Initial cleanup: ONE TIME ONLY"
+          flutter clean
+          flutter pub get
+
+          while [ "$CYCLE" -le "$MAX_CYCLES" ]; do
+
+            echo ""
+            echo "=========================================================="
+            echo "PERSISTENT REPAIR CYCLE $CYCLE / $MAX_CYCLES"
+            echo "Workspace is preserved between attempts."
+            echo "=========================================================="
+
+            # ----------------------------------------------------
+            # Snapshot current state BEFORE attempt
+            # ----------------------------------------------------
+
+            git status --short \
+              > "$GITHUB_WORKSPACE/.repair-state/git-status-before.txt" \
+              2>&1 || true
+
+            git diff \
+              > "$GITHUB_WORKSPACE/.repair-state/diff-before.patch" \
+              2>&1 || true
+
+            # ----------------------------------------------------
+            # Dependencies - NO CLEAN
+            # ----------------------------------------------------
+
+            echo "Updating dependencies without cleaning workspace..."
+            flutter pub get \
+              > "$GITHUB_WORKSPACE/.repair-state/pub-get-$CYCLE.log" \
+              2>&1
+
+            PUB_EXIT=$?
+
+            # ----------------------------------------------------
+            # ANALYZE
+            # ----------------------------------------------------
+
+            echo "Running analyzer..."
+
+            flutter analyze \
+              > "$GITHUB_WORKSPACE/.repair-state/analyze-$CYCLE.log" \
+              2>&1
+
+            ANALYZE_EXIT=$?
+
+            # ----------------------------------------------------
+            # TEST
+            # ----------------------------------------------------
+
+            echo "Running tests..."
+
+            flutter test --coverage \
+              > "$GITHUB_WORKSPACE/.repair-state/test-$CYCLE.log" \
+              2>&1
+
+            TEST_EXIT=$?
+
+            # ----------------------------------------------------
+            # BUILD DEBUG
+            # ----------------------------------------------------
+
+            echo "Running debug APK build..."
+
+            flutter build apk \
+              --debug \
+              --dart-define=API_BASE_URL="${API_BASE_URL}" \
+              > "$GITHUB_WORKSPACE/.repair-state/build-debug-$CYCLE.log" \
+              2>&1
+
+            DEBUG_EXIT=$?
+
+            # ----------------------------------------------------
+            # BUILD RELEASE
+            # ----------------------------------------------------
+
+            RELEASE_EXIT=1
+
+            if [ "$DEBUG_EXIT" -eq 0 ]; then
+
+              echo "Running release APK build..."
+
+              flutter build apk \
+                --release \
+                --dart-define=API_BASE_URL="${API_BASE_URL}" \
+                > "$GITHUB_WORKSPACE/.repair-state/build-release-$CYCLE.log" \
+                2>&1
+
+              RELEASE_EXIT=$?
+
+            fi
+
+            # ----------------------------------------------------
+            # SUCCESS CHECK
+            # ----------------------------------------------------
+
+            if [ "$PUB_EXIT" -eq 0 ] &&
+               [ "$ANALYZE_EXIT" -eq 0 ] &&
+               [ "$TEST_EXIT" -eq 0 ] &&
+               [ "$DEBUG_EXIT" -eq 0 ] &&
+               [ "$RELEASE_EXIT" -eq 0 ]; then
+
+              echo ""
+              echo "=========================================================="
+              echo "SUCCESS"
+              echo "All checks passed in persistent workspace."
+              echo "=========================================================="
+
+              SUCCESS=1
+              break
+            fi
+
+            # ----------------------------------------------------
+            # COLLECT ERROR CONTEXT
+            # ----------------------------------------------------
+
+            echo ""
+            echo "Failure detected. Collecting diagnostics..."
+
+            {
+              echo "=== PUB GET ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/pub-get-$CYCLE.log"
+
+              echo ""
+              echo "=== ANALYZE ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/analyze-$CYCLE.log"
+
+              echo ""
+              echo "=== TEST ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/test-$CYCLE.log"
+
+              echo ""
+              echo "=== DEBUG BUILD ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/build-debug-$CYCLE.log"
+
+              echo ""
+              echo "=== RELEASE BUILD ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/build-release-$CYCLE.log" 2>/dev/null || true
+            } > "$GITHUB_WORKSPACE/.repair-state/current-failure-$CYCLE.txt"
+
+            # ----------------------------------------------------
+            # IMPORTANT:
+            # NO flutter clean
+            # NO git reset
+            # NO checkout
+            # NO delete workspace
+            # ----------------------------------------------------
+
+            echo ""
+            echo "Preserving workspace."
+            echo "Starting repair on the CURRENT state."
+
+            # ----------------------------------------------------
+            # SAFE LOCAL AUTO-FIX
+            # ----------------------------------------------------
+
+            dart fix --apply \
+              > "$GITHUB_WORKSPACE/.repair-state/dart-fix-$CYCLE.log" \
+              2>&1 || true
+
+            dart format lib test integration_test \
+              > "$GITHUB_WORKSPACE/.repair-state/format-$CYCLE.log" \
+              2>&1 || true
+
+            flutter pub get \
+              > "$GITHUB_WORKSPACE/.repair-state/pub-get-repair-$CYCLE.log" \
+              2>&1 || true
+
+            # ----------------------------------------------------
+            # Re-run NDK repair WITHOUT cleaning anything
+            # ----------------------------------------------------
+
+            GRADLE_KTS="$(find android \
+              -type f \
+              -path "*/app/build.gradle.kts" \
+              | head -1 || true)"
+
+            GRADLE_GROOVY="$(find android \
+              -type f \
+              -path "*/app/build.gradle" \
+              | head -1 || true)"
+
+            if [ -n "$GRADLE_KTS" ]; then
+
+              if grep -q "ndkVersion" "$GRADLE_KTS"; then
+                sed -i \
+                  "s/ndkVersion[[:space:]]*=.*/ndkVersion = \"${NDK_VERSION}\"/" \
+                  "$GRADLE_KTS"
+              else
+                sed -i \
+                  "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                  "$GRADLE_KTS"
+              fi
+
+            elif [ -n "$GRADLE_GROOVY" ]; then
+
+              if grep -q "ndkVersion" "$GRADLE_GROOVY"; then
+                sed -i \
+                  "s/ndkVersion[[:space:]].*/ndkVersion \"${NDK_VERSION}\"/" \
+                  "$GRADLE_GROOVY"
+              else
+                sed -i \
+                  "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                  "$GRADLE_GROOVY"
+              fi
+
+            fi
+
+            # ----------------------------------------------------
+            # Show exactly what changed
+            # ----------------------------------------------------
+
+            git status --short \
+              > "$GITHUB_WORKSPACE/.repair-state/git-status-after-repair-$CYCLE.txt" \
+              2>&1 || true
+
+            git diff \
+              > "$GITHUB_WORKSPACE/.repair-state/diff-after-repair-$CYCLE.patch" \
+              2>&1 || true
+
+            echo ""
+            echo "Repair complete."
+            echo "Workspace preserved."
+            echo "Moving to next cycle."
+
+            CYCLE=$((CYCLE + 1))
+
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+
+            echo ""
+            echo "=========================================================="
+            echo "REPAIR LIMIT REACHED"
+            echo "=========================================================="
+
+            echo "Last diagnostics:"
+            tail -500 \
+              "$GITHUB_WORKSPACE/.repair-state/current-failure-$((CYCLE-1)).txt" \
+              || true
+
+            exit 1
+          fi
+
+          echo "FINAL_SUCCESS=1" >> "$GITHUB_OUTPUT"
